@@ -1,6 +1,8 @@
 //! continuous distributions and special functions: gamma, beta, error,
 //! normal, lognormal, chi-square, t and f families, their inverses, the
-//! chi-square, t and f hypothesis tests, and the confidence intervals.
+//! chi-square, t, f and z hypothesis tests, and the confidence intervals; the
+//! exponential, weibull and fisher transforms; and the discrete binomial,
+//! poisson, hypergeometric and negative binomial distributions.
 //! semantics follow microsoft's function reference: integer arguments such
 //! as degrees of freedom are truncated, out-of-domain arguments give
 //! `#NUM!`, non-numeric arguments give `#VALUE!`, and the compatibility
@@ -220,7 +222,7 @@ pub(crate) fn beta_inv(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
         Err(e) => return err(e),
     };
     let (p, alpha, beta) = (v[0], v[1], v[2]);
-    if !(0.0..=1.0).contains(&p) || alpha <= 0.0 || beta <= 0.0 || hi <= lo {
+    if p <= 0.0 || p >= 1.0 || alpha <= 0.0 || beta <= 0.0 || hi <= lo {
         return err(ErrorValue::Num);
     }
     let t = special::beta_quantile(alpha, beta, p, 1.0 - p);
@@ -623,7 +625,8 @@ pub(crate) fn t_inv(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
 }
 
 /// T.INV.2T and TINV(probability, deg_freedom): the two-tailed inverse,
-/// returned as a positive value.
+/// T.INV(1 - probability / 2). excel takes probabilities up to 2, where the
+/// answer turns negative.
 pub(crate) fn t_inv_2t(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
     if args.len() != 2 {
         return err(ErrorValue::Value);
@@ -636,11 +639,14 @@ pub(crate) fn t_inv_2t(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
         Ok(v) => v,
         Err(e) => return err(e),
     };
-    if p <= 0.0 || p > 1.0 || df < 1.0 {
+    if p <= 0.0 || p >= 2.0 || df < 1.0 {
         return err(ErrorValue::Num);
     }
     if p == 1.0 {
         return finish(ctx, 0.0);
+    }
+    if p > 1.0 {
+        return finish(ctx, -special::t_upper_quantile(1.0 - 0.5 * p, df));
     }
     finish(ctx, special::t_upper_quantile(0.5 * p, df))
 }
@@ -794,6 +800,356 @@ pub(crate) fn confidence_t(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
     }
     let critical = special::t_upper_quantile(0.5 * alpha, (size - 1) as f64);
     finish(ctx, critical * sd / (size as f64).sqrt())
+}
+
+/// STANDARDIZE(x, mean, standard_dev).
+pub(crate) fn standardize(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    let v = match numbers(args, ctx, 3) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    if v[2] <= 0.0 {
+        return err(ErrorValue::Num);
+    }
+    finite((v[0] - v[1]) / v[2])
+}
+
+/// FISHER(x): atanh(x) for -1 < x < 1.
+pub(crate) fn fisher(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    let v = match numbers(args, ctx, 1) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    if v[0] <= -1.0 || v[0] >= 1.0 {
+        return err(ErrorValue::Num);
+    }
+    finite(fmath::atanh(v[0]))
+}
+
+/// FISHERINV(y): tanh(y).
+pub(crate) fn fisherinv(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    let v = match numbers(args, ctx, 1) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    finite(fmath::tanh(v[0]))
+}
+
+/// EXPON.DIST and EXPONDIST(x, lambda, cumulative).
+pub(crate) fn expon_dist(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 3 {
+        return err(ErrorValue::Value);
+    }
+    let v = match first_numbers(args, ctx, 2) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let cumulative = match flag(args, ctx, 2) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let (x, lambda) = (v[0], v[1]);
+    if x < 0.0 || lambda <= 0.0 {
+        return err(ErrorValue::Num);
+    }
+    finite(if cumulative {
+        -fmath::exp_m1(-lambda * x)
+    } else {
+        lambda * fmath::exp(-lambda * x)
+    })
+}
+
+/// WEIBULL.DIST and WEIBULL(x, alpha, beta, cumulative).
+pub(crate) fn weibull_dist(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 4 {
+        return err(ErrorValue::Value);
+    }
+    let v = match first_numbers(args, ctx, 3) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let cumulative = match flag(args, ctx, 3) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let (x, alpha, beta) = (v[0], v[1], v[2]);
+    if x < 0.0 || alpha <= 0.0 || beta <= 0.0 {
+        return err(ErrorValue::Num);
+    }
+    let power = fmath::pow(x / beta, alpha);
+    finite(if cumulative {
+        -fmath::exp_m1(-power)
+    } else {
+        alpha / beta * fmath::pow(x / beta, alpha - 1.0) * fmath::exp(-power)
+    })
+}
+
+/// Z.TEST and ZTEST(array, x, [sigma]): the one-tailed p-value of a z-test,
+/// with the sample standard deviation when sigma is omitted.
+pub(crate) fn z_test(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 2 && args.len() != 3 {
+        return err(ErrorValue::Value);
+    }
+    let nums = match super::collect_numbers(&args[..1], ctx) {
+        Ok(nums) => nums,
+        Err(e) => return err(e),
+    };
+    let x = match nth_number(args, ctx, 1) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    if nums.is_empty() {
+        return err(ErrorValue::NA);
+    }
+    let (mean, variance) = sample_stats(&nums);
+    let sigma = match args.get(2) {
+        Some(arg) if !omitted(arg) => match nth_number(args, ctx, 2) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        },
+        _ => variance.sqrt(),
+    };
+    if sigma == 0.0 {
+        return err(ErrorValue::Div0);
+    }
+    let z = (mean - x) / (sigma / (nums.len() as f64).sqrt());
+    finish(ctx, special::norm_cdf(-z))
+}
+
+/// the summed terms of a discrete distribution, charged to the budget.
+fn charge_terms(ctx: &EvalContext<'_>, terms: f64) -> Result<(), ErrorValue> {
+    if ctx.consume_cells(crate::array::step_units(terms.min(u64::MAX as f64) as u64)) {
+        Ok(())
+    } else {
+        Err(ErrorValue::Num)
+    }
+}
+
+/// BINOM.DIST and BINOMDIST(number_s, trials, probability_s, cumulative).
+pub(crate) fn binom_dist(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 4 {
+        return err(ErrorValue::Value);
+    }
+    let v = match first_numbers(args, ctx, 3) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let cumulative = match flag(args, ctx, 3) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let (k, n, p) = (v[0].trunc(), v[1].trunc(), v[2]);
+    if k < 0.0 || k > n || !(0.0..=1.0).contains(&p) {
+        return err(ErrorValue::Num);
+    }
+    finish(
+        ctx,
+        if cumulative {
+            special::binom_cdf(k, n, p, 1.0 - p)
+        } else {
+            special::binom_pmf(k, n, p, 1.0 - p)
+        },
+    )
+}
+
+/// BINOM.DIST.RANGE(trials, probability_s, number_s, [number_s2]): the
+/// probability of `number_s` through `number_s2` successes.
+pub(crate) fn binom_dist_range(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    let v = match number_range(args, ctx, 3, 4) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let (n, p, s) = (v[0].trunc(), v[1], v[2].trunc());
+    let s2 = v.get(3).map_or(s, |s2| s2.trunc());
+    if n < 0.0 || !(0.0..=1.0).contains(&p) || s < 0.0 || s > n || s2 < s || s2 > n {
+        return err(ErrorValue::Num);
+    }
+    let q = 1.0 - p;
+    const SUMMED: f64 = 4096.0;
+    if s2 - s < SUMMED {
+        if let Err(e) = charge_terms(ctx, s2 - s + 1.0) {
+            return err(e);
+        }
+        let mut total = 0.0;
+        let mut k = s;
+        while k <= s2 {
+            total += special::binom_pmf(k, n, p, q);
+            k += 1.0;
+        }
+        return finish(ctx, total);
+    }
+    let below = if s > 0.0 {
+        special::binom_cdf(s - 1.0, n, p, q)
+    } else {
+        0.0
+    };
+    let above = if s2 < n {
+        special::beta_pq(n - s2, s2 + 1.0, q, p).1
+    } else {
+        0.0
+    };
+    finish(ctx, 1.0 - below - above)
+}
+
+/// BINOM.INV and CRITBINOM(trials, probability_s, alpha): the smallest number
+/// of successes whose cumulative probability reaches alpha.
+pub(crate) fn binom_inv(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    let v = match numbers(args, ctx, 3) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let (n, p, alpha) = (v[0].trunc(), v[1], v[2]);
+    if n < 0.0 || p <= 0.0 || p >= 1.0 || alpha <= 0.0 || alpha >= 1.0 {
+        return err(ErrorValue::Num);
+    }
+    let (mut lo, mut hi) = (0.0f64, n);
+    while lo < hi {
+        let mid = (0.5 * (lo + hi)).floor();
+        if special::binom_cdf(mid, n, p, 1.0 - p) >= alpha {
+            hi = mid;
+        } else {
+            lo = mid + 1.0;
+        }
+    }
+    finish(ctx, lo)
+}
+
+/// POISSON.DIST and POISSON(x, mean, cumulative).
+pub(crate) fn poisson_dist(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 3 {
+        return err(ErrorValue::Value);
+    }
+    let v = match first_numbers(args, ctx, 2) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let cumulative = match flag(args, ctx, 2) {
+        Ok(b) => b,
+        Err(e) => return err(e),
+    };
+    let (x, mean) = (v[0].trunc(), v[1]);
+    if x < 0.0 || mean < 0.0 {
+        return err(ErrorValue::Num);
+    }
+    finish(
+        ctx,
+        if cumulative {
+            special::gamma_q(x + 1.0, mean)
+        } else {
+            special::poisson_pmf(x, mean)
+        },
+    )
+}
+
+/// the hypergeometric probability of `x` successes in a sample of `n` drawn
+/// from `total` items of which `good` are successes.
+fn hypgeom_pmf(x: f64, n: f64, good: f64, total: f64) -> f64 {
+    let bad = total - good;
+    let p = n / total;
+    let q = (total - n) / total;
+    special::binom_pmf(x, good, p, q) * special::binom_pmf(n - x, bad, p, q)
+        / special::binom_pmf(n, total, p, q)
+}
+
+/// HYPGEOM.DIST(sample_s, number_sample, population_s, number_pop,
+/// cumulative) and HYPGEOMDIST without the cumulative flag.
+pub(crate) fn hypgeom_dist(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    hypergeometric(args, ctx, true)
+}
+
+pub(crate) fn hypgeomdist(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    hypergeometric(args, ctx, false)
+}
+
+fn hypergeometric(args: &[Expr], ctx: &EvalContext<'_>, flagged: bool) -> CellValue {
+    if args.len() != if flagged { 5 } else { 4 } {
+        return err(ErrorValue::Value);
+    }
+    let v = match first_numbers(args, ctx, 4) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let cumulative = if flagged {
+        match flag(args, ctx, 4) {
+            Ok(b) => b,
+            Err(e) => return err(e),
+        }
+    } else {
+        false
+    };
+    let (x, n, good, total) = (v[0].trunc(), v[1].trunc(), v[2].trunc(), v[3].trunc());
+    if x < 0.0 || total <= 0.0 || n <= 0.0 || n > total || good < 0.0 || good > total {
+        return err(ErrorValue::Num);
+    }
+    // outside the support the probability is zero, not an error
+    let least = (n - total + good).max(0.0);
+    let most = n.min(good);
+    if !cumulative {
+        let value = if x < least || x > most {
+            0.0
+        } else {
+            hypgeom_pmf(x, n, good, total)
+        };
+        return finish(ctx, value);
+    }
+    if x < least {
+        return finish(ctx, 0.0);
+    }
+    if x >= most {
+        return finish(ctx, 1.0);
+    }
+    if let Err(e) = charge_terms(ctx, x - least + 1.0) {
+        return err(e);
+    }
+    let mut sum = 0.0;
+    let mut k = least;
+    while k <= x {
+        sum += hypgeom_pmf(k, n, good, total);
+        k += 1.0;
+    }
+    finish(ctx, sum.min(1.0))
+}
+
+/// NEGBINOM.DIST(number_f, number_s, probability_s, cumulative) and
+/// NEGBINOMDIST without the cumulative flag: failures before the
+/// `number_s`th success.
+pub(crate) fn negbinom_dist(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    negative_binomial(args, ctx, true)
+}
+
+pub(crate) fn negbinomdist(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    negative_binomial(args, ctx, false)
+}
+
+fn negative_binomial(args: &[Expr], ctx: &EvalContext<'_>, flagged: bool) -> CellValue {
+    if args.len() != if flagged { 4 } else { 3 } {
+        return err(ErrorValue::Value);
+    }
+    let v = match first_numbers(args, ctx, 3) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let cumulative = if flagged {
+        match flag(args, ctx, 3) {
+            Ok(b) => b,
+            Err(e) => return err(e),
+        }
+    } else {
+        false
+    };
+    let (f, s, p) = (v[0].trunc(), v[1].trunc(), v[2]);
+    if f < 0.0 || s < 1.0 || p <= 0.0 || p >= 1.0 {
+        return err(ErrorValue::Num);
+    }
+    let q = 1.0 - p;
+    finish(
+        ctx,
+        if cumulative {
+            special::beta_pq(s, f + 1.0, p, q).0
+        } else {
+            s / (s + f) * special::binom_pmf(s, s + f, p, q)
+        },
+    )
 }
 
 /// one test argument by position: `None` where a cell is not a number. the

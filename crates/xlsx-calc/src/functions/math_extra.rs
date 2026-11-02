@@ -460,6 +460,43 @@ pub(crate) fn combina(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
     })
 }
 
+/// PERMUT(number, chosen): ordered selections without repetition,
+/// number! / (number - chosen)!, both truncated.
+pub(crate) fn permut(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    compute(|| {
+        arity(args, 2, 2)?;
+        let number = nth_number(args, ctx, 0)?.trunc();
+        let chosen = nth_number(args, ctx, 1)?.trunc();
+        if number < 0.0 || chosen < 0.0 || number < chosen {
+            return Err(ErrorValue::Num);
+        }
+        let mut result = 1.0;
+        let mut factor = number - chosen + 1.0;
+        while factor <= number {
+            result *= factor;
+            if !result.is_finite() {
+                return Err(ErrorValue::Num);
+            }
+            factor += 1.0;
+        }
+        Ok(result)
+    })
+}
+
+/// PERMUTATIONA(number, chosen): ordered selections with repetition,
+/// number ^ chosen, both truncated.
+pub(crate) fn permutationa(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    compute(|| {
+        arity(args, 2, 2)?;
+        let number = nth_number(args, ctx, 0)?.trunc();
+        let chosen = nth_number(args, ctx, 1)?.trunc();
+        if number < 0.0 || chosen < 0.0 {
+            return Err(ErrorValue::Num);
+        }
+        Ok(fmath::pow(number, chosen))
+    })
+}
+
 /// `first (first + 1) ... (first + k - 1) / k!`, that is
 /// C(first + k - 1, k), for whole `first >= k >= 0`. both sides are passed as
 /// written, so no count is recovered by subtracting rounded totals; the

@@ -817,6 +817,10 @@ fn lifted_positions(name: &str) -> Option<&'static [usize]> {
         "FORECAST" | "FORECAST.LINEAR" => &[0],
         "LARGE" | "SMALL" => &[1],
         "PERCENTILE" | "PERCENTILE.INC" | "QUARTILE" | "QUARTILE.INC" => &[1],
+        "PERCENTILE.EXC" | "QUARTILE.EXC" => &[1],
+        "PERCENTRANK" | "PERCENTRANK.INC" | "PERCENTRANK.EXC" => &[1, 2],
+        "Z.TEST" | "ZTEST" => &[1, 2],
+        "PROB" => &[2, 3],
         "IRR" => &[1],
         "XIRR" => &[2],
         "MIRR" => &[1, 2],
@@ -862,6 +866,10 @@ fn lifts(name: &str) -> bool {
             | "BIN2DEC"
             | "BIN2HEX"
             | "BIN2OCT"
+            | "BINOM.DIST"
+            | "BINOM.DIST.RANGE"
+            | "BINOM.INV"
+            | "BINOMDIST"
             | "BITAND"
             | "BITLSHIFT"
             | "BITOR"
@@ -895,6 +903,7 @@ fn lifts(name: &str) -> bool {
             | "COUPNCD"
             | "COUPNUM"
             | "COUPPCD"
+            | "CRITBINOM"
             | "CSC"
             | "CSCH"
             | "DATE"
@@ -922,6 +931,8 @@ fn lifts(name: &str) -> bool {
             | "EVEN"
             | "EXACT"
             | "EXP"
+            | "EXPON.DIST"
+            | "EXPONDIST"
             | "F.DIST"
             | "F.DIST.RT"
             | "F.INV"
@@ -932,6 +943,8 @@ fn lifts(name: &str) -> bool {
             | "FIND"
             | "FINDB"
             | "FINV"
+            | "FISHER"
+            | "FISHERINV"
             | "FIXED"
             | "FLOOR"
             | "FLOOR.MATH"
@@ -949,6 +962,8 @@ fn lifts(name: &str) -> bool {
             | "HEX2DEC"
             | "HEX2OCT"
             | "HOUR"
+            | "HYPGEOM.DIST"
+            | "HYPGEOMDIST"
             | "IMABS"
             | "IMAGINARY"
             | "IMARGUMENT"
@@ -1009,6 +1024,8 @@ fn lifts(name: &str) -> bool {
             | "MONTH"
             | "MROUND"
             | "N"
+            | "NEGBINOM.DIST"
+            | "NEGBINOMDIST"
             | "NORM.INV"
             | "NORM.S.DIST"
             | "NORM.S.INV"
@@ -1026,6 +1043,10 @@ fn lifts(name: &str) -> bool {
             | "ODDLPRICE"
             | "ODDLYIELD"
             | "PHI"
+            | "PERMUT"
+            | "PERMUTATIONA"
+            | "POISSON"
+            | "POISSON.DIST"
             | "POWER"
             | "PRICE"
             | "PRICEDISC"
@@ -1053,6 +1074,7 @@ fn lifts(name: &str) -> bool {
             | "SINH"
             | "SQRT"
             | "SQRTPI"
+            | "STANDARDIZE"
             | "SUBSTITUTE"
             | "T"
             | "T.DIST"
@@ -1080,6 +1102,8 @@ fn lifts(name: &str) -> bool {
             | "VALUETOTEXT"
             | "WEEKDAY"
             | "WEEKNUM"
+            | "WEIBULL"
+            | "WEIBULL.DIST"
             | "YEAR"
             | "_LONGTEXT"
             | "RATE"
@@ -1152,8 +1176,11 @@ fn lookup_array(name: &str) -> Option<ArrayFn> {
         "XLOOKUP" => xlookup,
         "XMATCH" => xmatch,
         "LINEST" => linest,
+        "LOGEST" => logest,
         "TREND" => trend,
+        "GROWTH" => growth,
         "FREQUENCY" => frequency,
+        "MODE.MULT" => mode_mult,
         "MMULT" => mmult,
         "MINVERSE" => crate::functions::math_extra::minverse,
         "MUNIT" => crate::functions::math_extra::munit,
@@ -2466,65 +2493,67 @@ fn indices(args: &[Expr], ctx: &EvalContext<'_>, name: &str, by_row: bool) -> Va
 /// more predictors. coefficients come back in reverse column order with the
 /// intercept last, which is excel's layout; `stats` adds four more rows.
 fn linest(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
+    regression_block(args, ctx, false)
+}
+
+/// LOGEST(known_y, [known_x], [const], [stats]): LINEST over ln(y), with the
+/// coefficients raised back to the bases of `y = b * m1^x1 * ...`; the
+/// statistics stay in log space.
+fn logest(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
+    regression_block(args, ctx, true)
+}
+
+/// the known y values, as ln(y) when `log` is set; a non-positive y has no
+/// logarithm.
+fn known_y(ys_block: &Array, ctx: &EvalContext<'_>, log: bool) -> Result<Vec<f64>, ErrorValue> {
+    let n = output_cells(ys_block.rows, ys_block.cols)?;
+    let mut ys = Vec::with_capacity(n);
+    for row in 0..ys_block.rows {
+        for col in 0..ys_block.cols {
+            let y = ctx.number(&ys_block.at(row, col))?;
+            ys.push(match log {
+                true if y <= 0.0 => return Err(ErrorValue::Num),
+                true => crate::fmath::ln(y),
+                false => y,
+            });
+        }
+    }
+    Ok(ys)
+}
+
+fn regression_block(args: &[Expr], ctx: &EvalContext<'_>, log: bool) -> Value {
     result((|| {
         if args.is_empty() || args.len() > 4 {
             return Err(ErrorValue::Value);
         }
         let ys_block = argument(args, ctx, 0)?;
-        let n = output_cells(ys_block.rows, ys_block.cols)?;
-        let mut ys = Vec::with_capacity(n);
-        for row in 0..ys_block.rows {
-            for col in 0..ys_block.cols {
-                ys.push(ctx.number(&ys_block.at(row, col))?);
-            }
-        }
+        let ys = known_y(&ys_block, ctx, log)?;
         // predictors as columns; a y vector laid out in rows means x is too
         let down = ys_block.cols == 1 && ys_block.rows > 1;
-        let xs: Vec<Vec<f64>> = match args.get(1) {
-            Some(_) => {
-                let xb = argument(args, ctx, 1)?;
-                let (vars, obs) = if down {
-                    (xb.cols, xb.rows)
-                } else {
-                    (xb.rows, xb.cols)
-                };
-                if obs != ys.len() {
-                    return Err(ErrorValue::Ref);
-                }
-                let mut columns = Vec::with_capacity(vars);
-                for v in 0..vars {
-                    let mut column = Vec::with_capacity(obs);
-                    for o in 0..obs {
-                        let cell = if down { xb.at(o, v) } else { xb.at(v, o) };
-                        column.push(ctx.number(&cell)?);
-                    }
-                    columns.push(column);
-                }
-                columns
-            }
-            None => vec![(1..=ys.len()).map(|i| i as f64).collect()],
-        };
-        let intercept = match args.get(2) {
-            Some(_) => to_bool(&evaluate(&args[2], ctx))?,
-            None => true,
-        };
-        let stats = match args.get(3) {
-            Some(_) => to_bool(&evaluate(&args[3], ctx))?,
-            None => false,
-        };
+        let xs = known_x(args, ctx, ys.len(), down)?;
+        let intercept = optional_bool(args, ctx, 2, true)?;
+        let stats = optional_bool(args, ctx, 3, false)?;
         let vars = xs.len();
         let height = if stats { 5 } else { 1 };
         reserve(ctx, height, vars + 1)?;
         let fit = regress(ctx, &ys, &xs, intercept)?;
+        let coefficient = |c: f64| {
+            if log {
+                crate::functions::finite(crate::fmath::exp(c))
+            } else {
+                num(c)
+            }
+        };
         // excel emits the coefficients right to left, intercept last
-        let mut first: Vec<CellValue> = (0..vars).rev().map(|i| num(fit.beta[i])).collect();
-        first.push(num(fit.intercept));
+        let mut first: Vec<CellValue> = (0..vars).rev().map(|i| coefficient(fit.beta[i])).collect();
+        first.push(coefficient(fit.intercept));
         if !stats {
             return Ok(reserved(height, vars + 1, first));
         }
-        let mut second: Vec<CellValue> = (0..vars).rev().map(|i| num(fit.se[i])).collect();
+        let statistic = crate::functions::finite;
+        let mut second: Vec<CellValue> = (0..vars).rev().map(|i| statistic(fit.se[i])).collect();
         second.push(if intercept {
-            num(fit.se_intercept)
+            statistic(fit.se_intercept)
         } else {
             CellValue::Error {
                 value: ErrorValue::NA,
@@ -2534,13 +2563,13 @@ fn linest(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
             value: ErrorValue::NA,
         };
         let mut rows = vec![first, second];
-        let mut row = vec![num(fit.r2), num(fit.se_y)];
+        let mut row = vec![statistic(fit.r2), statistic(fit.se_y)];
         row.resize(vars + 1, blank());
         rows.push(row);
-        let mut row = vec![num(fit.f), num(fit.df)];
+        let mut row = vec![statistic(fit.f), num(fit.df)];
         row.resize(vars + 1, blank());
         rows.push(row);
-        let mut row = vec![num(fit.ss_reg), num(fit.ss_resid)];
+        let mut row = vec![statistic(fit.ss_reg), statistic(fit.ss_resid)];
         row.resize(vars + 1, blank());
         rows.push(row);
         Ok(reserved(
@@ -2554,31 +2583,38 @@ fn linest(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
 /// TREND(known_y, [known_x], [new_x], [const]): the least-squares line LINEST
 /// fits, evaluated at `new_x` (at the known predictors when it is omitted).
 fn trend(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
+    projection(args, ctx, false)
+}
+
+/// GROWTH(known_y, [known_x], [new_x], [const]): the exponential curve LOGEST
+/// fits, evaluated at `new_x`.
+fn growth(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
+    projection(args, ctx, true)
+}
+
+fn projection(args: &[Expr], ctx: &EvalContext<'_>, log: bool) -> Value {
     result((|| {
         if args.is_empty() || args.len() > 4 {
             return Err(ErrorValue::Value);
         }
         let ys_block = argument(args, ctx, 0)?;
-        let n = output_cells(ys_block.rows, ys_block.cols)?;
-        let mut ys = Vec::with_capacity(n);
-        for row in 0..ys_block.rows {
-            for col in 0..ys_block.cols {
-                ys.push(ctx.number(&ys_block.at(row, col))?);
-            }
-        }
+        let ys = known_y(&ys_block, ctx, log)?;
         // predictors as columns; a y vector laid out in rows means x is too
         let down = ys_block.cols == 1 && ys_block.rows > 1;
         let xs = known_x(args, ctx, ys.len(), down)?;
         let intercept = optional_bool(args, ctx, 3, true)?;
         let fit = regress(ctx, &ys, &xs, intercept)?;
-        let predict = |point: &[f64]| -> f64 {
-            fit.intercept + point.iter().zip(&fit.beta).map(|(x, b)| x * b).sum::<f64>()
+        let predict = |point: &[f64]| -> CellValue {
+            let y = fit.intercept + point.iter().zip(&fit.beta).map(|(x, b)| x * b).sum::<f64>();
+            if log {
+                crate::functions::finite(crate::fmath::exp(y))
+            } else {
+                num(y)
+            }
         };
         let Some(new_block) = optional_block(args, ctx, 2)? else {
             reserve(ctx, ys_block.rows, ys_block.cols)?;
-            let cells = (0..ys.len())
-                .map(|o| num(predict(&column_at(&xs, o))))
-                .collect();
+            let cells = (0..ys.len()).map(|o| predict(&column_at(&xs, o))).collect();
             return Ok(reserved(ys_block.rows, ys_block.cols, cells));
         };
         if xs.len() == 1 {
@@ -2586,7 +2622,7 @@ fn trend(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
             let mut cells = Vec::with_capacity(count);
             for row in 0..new_block.rows {
                 for col in 0..new_block.cols {
-                    cells.push(num(predict(&[ctx.number(&new_block.at(row, col))?])));
+                    cells.push(predict(&[ctx.number(&new_block.at(row, col))?]));
                 }
             }
             return Ok(reserved(new_block.rows, new_block.cols, cells));
@@ -2611,7 +2647,7 @@ fn trend(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
                 };
                 coordinates.push(ctx.number(&cell)?);
             }
-            cells.push(num(predict(&coordinates)));
+            cells.push(predict(&coordinates));
         }
         Ok(reserved(rows, cols, cells))
     })())
@@ -2708,6 +2744,40 @@ fn frequency(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
     })())
 }
 
+/// MODE.MULT(number, ...): every value that occurs most often, in order of
+/// first appearance, as a column; `#N/A` when nothing repeats.
+fn mode_mult(args: &[Expr], ctx: &EvalContext<'_>) -> Value {
+    result((|| {
+        if args.is_empty() {
+            return Err(ErrorValue::Value);
+        }
+        let nums = crate::functions::collect_numbers(args, ctx)?;
+        let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        let mut counts: Vec<(f64, usize)> = Vec::new();
+        for value in nums {
+            let key = if value == 0.0 { 0 } else { value.to_bits() };
+            match seen.get(&key) {
+                Some(&index) => counts[index].1 += 1,
+                None => {
+                    seen.insert(key, counts.len());
+                    counts.push((value, 1));
+                }
+            }
+        }
+        let most = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
+        if most < 2 {
+            return Err(ErrorValue::NA);
+        }
+        let modes: Vec<CellValue> = counts
+            .into_iter()
+            .filter(|(_, count)| *count == most)
+            .map(|(value, _)| num(value))
+            .collect();
+        reserve(ctx, modes.len(), 1)?;
+        Ok(reserved(modes.len(), 1, modes))
+    })())
+}
+
 /// the numbers a block holds, skipping text, blanks and logicals as the
 /// distribution functions do; an error cell propagates.
 fn numbers_in(array: &Array) -> Result<Vec<f64>, ErrorValue> {
@@ -2751,93 +2821,103 @@ fn regress(
 /// ordinary least squares by householder QR. the normal equations square the
 /// design matrix's condition number, which a polynomial fit like
 /// `LINEST(y, x^{1,2,3,4,5,6})` does not survive; QR works on the matrix itself.
+/// a column the earlier ones already span (the constant first, then the
+/// predictors from last to first) is dropped as excel drops it: coefficient
+/// and standard error 0, and no degree of freedom spent.
 #[allow(clippy::needless_range_loop)]
 fn least_squares(ys: &[f64], xs: &[Vec<f64>], intercept: bool) -> Option<Fit> {
+    // a column whose part outside the earlier ones is this small, relative to
+    // the column itself, is taken to be in their span
+    const COLLINEAR: f64 = 1e-12;
     let n = ys.len();
     let vars = xs.len();
     if n == 0 || vars == 0 || xs.iter().any(|column| column.len() != n) {
         return None;
     }
-    let terms = vars + usize::from(intercept);
-    if n <= terms {
-        return None;
-    }
-    // design matrix, predictors first and the constant column last
+    let offset = usize::from(intercept);
+    let terms = vars + offset;
+    // the design column of predictor i
+    let position = |i: usize| offset + vars - 1 - i;
+    let value = |t: usize, r: usize| {
+        if t < offset {
+            1.0
+        } else {
+            xs[vars - 1 - (t - offset)][r]
+        }
+    };
     let mut a = vec![vec![0.0; terms]; n];
     for (r, row) in a.iter_mut().enumerate() {
         for (t, cell) in row.iter_mut().enumerate() {
-            *cell = if intercept && t == vars {
-                1.0
-            } else {
-                xs[t][r]
-            };
+            *cell = value(t, r);
         }
     }
+    let norms: Vec<f64> = (0..terms)
+        .map(|c| (0..n).map(|r| a[r][c] * a[r][c]).sum::<f64>().sqrt())
+        .collect();
     let mut b = ys.to_vec();
-    // householder reflections: A becomes R in place, b becomes Q'b
-    for k in 0..terms {
-        let norm = (k..n).map(|r| a[r][k] * a[r][k]).sum::<f64>().sqrt();
-        if norm < 1e-300 {
-            return None;
-        }
-        let alpha = if a[k][k] > 0.0 { -norm } else { norm };
-        let mut v = vec![0.0; n];
-        v[k] = a[k][k] - alpha;
-        for (r, slot) in v.iter_mut().enumerate().take(n).skip(k + 1) {
-            *slot = a[r][k];
-        }
-        let vtv = (k..n).map(|r| v[r] * v[r]).sum::<f64>();
-        if vtv < 1e-300 {
-            a[k][k] = alpha;
+    // householder reflections: A becomes R in place, b becomes Q'b; `pivots`
+    // holds the kept columns, the kth one owning row k of R
+    let mut pivots: Vec<usize> = Vec::with_capacity(terms);
+    for c in 0..terms {
+        let k = pivots.len();
+        let norm = (k..n).map(|r| a[r][c] * a[r][c]).sum::<f64>().sqrt();
+        if norm <= COLLINEAR * norms[c] {
             continue;
         }
-        for c in k..terms {
-            let dot = (k..n).map(|r| v[r] * a[r][c]).sum::<f64>();
+        let alpha = if a[k][c] > 0.0 { -norm } else { norm };
+        let mut v = vec![0.0; n];
+        v[k] = a[k][c] - alpha;
+        for r in k + 1..n {
+            v[r] = a[r][c];
+        }
+        let vtv = (k..n).map(|r| v[r] * v[r]).sum::<f64>();
+        if vtv > 0.0 {
+            for col in c..terms {
+                let dot = (k..n).map(|r| v[r] * a[r][col]).sum::<f64>();
+                let factor = 2.0 * dot / vtv;
+                for r in k..n {
+                    a[r][col] -= factor * v[r];
+                }
+            }
+            let dot = (k..n).map(|r| v[r] * b[r]).sum::<f64>();
             let factor = 2.0 * dot / vtv;
             for r in k..n {
-                a[r][c] -= factor * v[r];
+                b[r] -= factor * v[r];
             }
         }
-        let dot = (k..n).map(|r| v[r] * b[r]).sum::<f64>();
-        let factor = 2.0 * dot / vtv;
-        for r in k..n {
-            b[r] -= factor * v[r];
-        }
+        a[k][c] = alpha;
+        pivots.push(c);
     }
-    // back-substitute R x = Q'b
+    let rank = pivots.len();
+    if n <= rank {
+        return None;
+    }
+    // back-substitute R x = Q'b over the kept columns
     let mut coefficients = vec![0.0; terms];
-    for i in (0..terms).rev() {
-        if a[i][i].abs() < 1e-12 {
-            return None;
-        }
-        let sum: f64 = (i + 1..terms).map(|j| a[i][j] * coefficients[j]).sum();
-        coefficients[i] = (b[i] - sum) / a[i][i];
+    for i in (0..rank).rev() {
+        let sum: f64 = (i + 1..rank)
+            .map(|j| a[i][pivots[j]] * coefficients[pivots[j]])
+            .sum();
+        coefficients[pivots[i]] = (b[i] - sum) / a[i][pivots[i]];
     }
     // (X'X)^-1 = R^-1 R^-T, for the standard errors
-    let mut r_inverse = vec![vec![0.0; terms]; terms];
-    for i in (0..terms).rev() {
-        r_inverse[i][i] = 1.0 / a[i][i];
-        for j in i + 1..terms {
-            let sum: f64 = (i + 1..=j).map(|k| a[i][k] * r_inverse[k][j]).sum();
-            r_inverse[i][j] = -sum / a[i][i];
+    let mut r_inverse = vec![vec![0.0; rank]; rank];
+    for i in (0..rank).rev() {
+        r_inverse[i][i] = 1.0 / a[i][pivots[i]];
+        for j in i + 1..rank {
+            let sum: f64 = (i + 1..=j).map(|k| a[i][pivots[k]] * r_inverse[k][j]).sum();
+            r_inverse[i][j] = -sum / a[i][pivots[i]];
         }
     }
-    let covariance =
-        |i: usize| -> f64 { (i..terms).map(|k| r_inverse[i][k] * r_inverse[i][k]).sum() };
+    let mut covariance = vec![0.0; terms];
+    for (i, &c) in pivots.iter().enumerate() {
+        covariance[c] = (i..rank).map(|k| r_inverse[i][k] * r_inverse[i][k]).sum();
+    }
     let mean = ys.iter().sum::<f64>() / n as f64;
     let mut ss_resid = 0.0;
     let mut ss_total = 0.0;
     for r in 0..n {
-        let predicted: f64 = (0..terms)
-            .map(|t| {
-                coefficients[t]
-                    * if intercept && t == vars {
-                        1.0
-                    } else {
-                        xs[t][r]
-                    }
-            })
-            .sum();
+        let predicted: f64 = (0..terms).map(|t| coefficients[t] * value(t, r)).sum();
         ss_resid += (ys[r] - predicted).powi(2);
         ss_total += if intercept {
             (ys[r] - mean).powi(2)
@@ -2845,17 +2925,18 @@ fn least_squares(ys: &[f64], xs: &[Vec<f64>], intercept: bool) -> Option<Fit> {
             ys[r].powi(2)
         };
     }
-    let df = (n - terms) as f64;
+    let df = (n - rank) as f64;
     let variance = ss_resid / df;
     let ss_reg = ss_total - ss_resid;
+    let regressors = (rank - pivots.iter().filter(|&&c| c < offset).count()) as f64;
     Some(Fit {
-        beta: coefficients[..vars].to_vec(),
-        intercept: if intercept { coefficients[vars] } else { 0.0 },
+        beta: (0..vars).map(|i| coefficients[position(i)]).collect(),
+        intercept: if intercept { coefficients[0] } else { 0.0 },
         se: (0..vars)
-            .map(|i| (variance * covariance(i)).sqrt())
+            .map(|i| (variance * covariance[position(i)]).sqrt())
             .collect(),
         se_intercept: if intercept {
-            (variance * covariance(vars)).sqrt()
+            (variance * covariance[0]).sqrt()
         } else {
             0.0
         },
@@ -2865,11 +2946,7 @@ fn least_squares(ys: &[f64], xs: &[Vec<f64>], intercept: bool) -> Option<Fit> {
             1.0 - ss_resid / ss_total
         },
         se_y: variance.sqrt(),
-        f: if ss_resid == 0.0 {
-            f64::INFINITY
-        } else {
-            (ss_reg / vars as f64) / variance
-        },
+        f: (ss_reg / regressors) / variance,
         df,
         ss_reg,
         ss_resid,

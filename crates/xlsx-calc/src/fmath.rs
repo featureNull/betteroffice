@@ -230,3 +230,14 @@ pub(crate) fn ln_1p(x: f64) -> f64 {
         libm::log1p(x)
     }
 }
+
+pub(crate) fn exp_m1(x: f64) -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        x.exp_m1()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        libm::expm1(x)
+    }
+}

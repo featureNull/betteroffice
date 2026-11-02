@@ -828,3 +828,94 @@ pub(crate) fn chisq_tail(x: f64, df: f64) -> f64 {
 pub(crate) fn chisq_pdf(x: f64, df: f64) -> f64 {
     gamma_pdf(x, 0.5 * df, 2.0)
 }
+
+/// ln Gamma(n + 1) - ((n + 1/2) ln n - n + ln sqrt(2 pi)), the stirling
+/// remainder of ln n!.
+fn stirlerr(n: f64) -> f64 {
+    if n >= 10.0 {
+        stirling_tail(n)
+    } else {
+        lngamma(n + 1.0) - (n + 0.5) * n.ln() + n - LN_SQRT_2PI
+    }
+}
+
+/// x ln(x / m) + m - x, the deviance term of loader's saddle-point
+/// expansion, without cancellation when x is near m.
+fn bd0(x: f64, m: f64) -> f64 {
+    if (x - m).abs() < 0.1 * (x + m) {
+        let v = (x - m) / (x + m);
+        let mut s = (x - m) * v;
+        let mut ej = 2.0 * x * v;
+        let v2 = v * v;
+        for j in 1..MAX_ITER {
+            ej *= v2;
+            let next = s + ej / (2 * j + 1) as f64;
+            if next == s {
+                tick(j);
+                return next;
+            }
+            s = next;
+        }
+        tick(MAX_ITER);
+        return s;
+    }
+    x * (x / m).ln() + m - x
+}
+
+/// the binomial probability of exactly `x` successes in `n` trials, with
+/// q = 1 - p passed exactly (loader's saddle-point algorithm).
+pub(crate) fn binom_pmf(x: f64, n: f64, p: f64, q: f64) -> f64 {
+    if p == 0.0 {
+        return if x == 0.0 { 1.0 } else { 0.0 };
+    }
+    if q == 0.0 {
+        return if x == n { 1.0 } else { 0.0 };
+    }
+    if x < 0.0 || x > n {
+        return 0.0;
+    }
+    if x == 0.0 {
+        if n == 0.0 {
+            return 1.0;
+        }
+        let lc = if p < 0.1 {
+            -bd0(n, n * q) - n * p
+        } else {
+            n * q.ln()
+        };
+        return lc.exp();
+    }
+    if x == n {
+        let lc = if q < 0.1 {
+            -bd0(n, n * p) - n * q
+        } else {
+            n * p.ln()
+        };
+        return lc.exp();
+    }
+    let lc = stirlerr(n) - stirlerr(x) - stirlerr(n - x) - bd0(x, n * p) - bd0(n - x, n * q);
+    let lf = (2.0 * PI).ln() + x.ln() + (-x / n).ln_1p();
+    (lc - 0.5 * lf).exp()
+}
+
+/// the poisson probability of exactly `x` events at mean `lambda`.
+pub(crate) fn poisson_pmf(x: f64, lambda: f64) -> f64 {
+    if lambda == 0.0 {
+        return if x == 0.0 { 1.0 } else { 0.0 };
+    }
+    if x < 0.0 {
+        return 0.0;
+    }
+    if x == 0.0 {
+        return (-lambda).exp();
+    }
+    (-stirlerr(x) - bd0(x, lambda)).exp() / (2.0 * PI * x).sqrt()
+}
+
+/// the binomial cdf P(X <= k), as the incomplete beta I_q(n - k, k + 1).
+pub(crate) fn binom_cdf(k: f64, n: f64, p: f64, q: f64) -> f64 {
+    if k >= n {
+        return 1.0;
+    }
+    beta_pq(n - k, k + 1.0, q, p).0
+}

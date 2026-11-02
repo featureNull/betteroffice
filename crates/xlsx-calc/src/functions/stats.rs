@@ -613,7 +613,28 @@ fn ranked_value(code: i64, nums: &[f64], args: &[Expr], ctx: &EvalContext<'_>) -
                 Err(e) => err(e),
             }
         }
+        18 | 19 => match nth_number(args, ctx, args.len() - 1) {
+            Ok(k) => ranked_exclusive(code, &sorted, k),
+            Err(e) => err(e),
+        },
         _ => err(ErrorValue::Value),
+    }
+}
+
+/// codes 18 (PERCENTILE.EXC) and 19 (QUARTILE.EXC) over sorted values.
+fn ranked_exclusive(code: i64, sorted: &[f64], k: f64) -> CellValue {
+    let k = if code == 19 {
+        let quart = k.trunc();
+        if quart <= 0.0 || quart >= 4.0 {
+            return err(ErrorValue::Num);
+        }
+        quart / 4.0
+    } else {
+        k
+    };
+    match percentile_exc_of(sorted, k) {
+        Ok(v) => finite(v),
+        Err(e) => err(e),
     }
 }
 
@@ -655,7 +676,8 @@ pub(crate) fn subtotal(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
 }
 
 /// AGGREGATE(code, options, ...): the SUBTOTAL aggregates plus LARGE, SMALL,
-/// PERCENTILE and QUARTILE, with an options flag that says what to ignore.
+/// and both forms of PERCENTILE and QUARTILE, with an options flag that says
+/// what to ignore.
 /// Options 2,3,6,7 ignore errors, which is the whole point of the function in
 /// most sheets. options 0-3 (and an omitted options argument, which reads as
 /// 0) also ignore cells in a reference whose own formula contains a SUBTOTAL
@@ -693,7 +715,7 @@ pub(crate) fn aggregate(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
             Ok(nums) => numbers_value(code, &nums),
             Err(e) => err(e),
         },
-        14..=17 => {
+        14..=19 => {
             if rest.len() != 2 {
                 err(ErrorValue::Value)
             } else {
@@ -777,7 +799,7 @@ fn aggregate_ignoring_errors(
     scan: &mut NestedScan,
 ) -> CellValue {
     let take = match code {
-        14..=17 => args.len().saturating_sub(1),
+        14..=19 => args.len().saturating_sub(1),
         _ => args.len(),
     };
     let mut nums = numeric_literals(&args[..take], ctx, skip_nested, scan);
@@ -799,9 +821,9 @@ fn aggregate_ignoring_errors(
         }
         finite((squares / (n - lost)).sqrt())
     };
-    // 14-17 take a rank or quantile as their final argument
+    // 14-19 take a rank or quantile as their final argument
     let k = match code {
-        14..=17 => match nth_number(args, ctx, args.len() - 1) {
+        14..=19 => match nth_number(args, ctx, args.len() - 1) {
             Ok(k) => k,
             Err(e) => return err(e),
         },
@@ -831,6 +853,7 @@ fn aggregate_ignoring_errors(
             Ok(v) => finite(v),
             Err(e) => err(e),
         },
+        18 | 19 => ranked_exclusive(code, &nums, k),
         _ => err(ErrorValue::Value),
     }
 }
@@ -1510,4 +1533,192 @@ fn centered(nums: &[f64]) -> (f64, f64) {
     }
     let total: f64 = nums.iter().map(|x| (x - mean) * (x - mean)).sum();
     (mean, total / (n - 1.0))
+}
+
+/// STEYX(known_y, known_x): the standard error of the y predicted by the
+/// least-squares line; fewer than three pairs is `#DIV/0!`.
+pub(crate) fn steyx(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    let (ys, xs) = match pairs(args, ctx) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let (n, _, _, sxx, syy, sxy) = moments(&ys, &xs);
+    if ys.len() < 3 || sxx == 0.0 {
+        return err(ErrorValue::Div0);
+    }
+    finite(((syy - sxy * sxy / sxx).max(0.0) / (n - 2.0)).sqrt())
+}
+
+/// PERCENTILE.EXC over sorted values: the order statistic at k(n+1),
+/// interpolated; a rank outside 1..=n is `#NUM!`.
+fn percentile_exc_of(sorted: &[f64], k: f64) -> Result<f64, ErrorValue> {
+    let n = sorted.len();
+    if n == 0 || k <= 0.0 || k >= 1.0 {
+        return Err(ErrorValue::Num);
+    }
+    let position = k * (n + 1) as f64;
+    if position < 1.0 || position > n as f64 {
+        return Err(ErrorValue::Num);
+    }
+    let lower = position.floor() as usize;
+    if lower == n {
+        return Ok(sorted[n - 1]);
+    }
+    let fraction = position - lower as f64;
+    Ok(sorted[lower - 1] + fraction * (sorted[lower] - sorted[lower - 1]))
+}
+
+fn sorted_first_argument(args: &[Expr], ctx: &EvalContext<'_>) -> Result<Vec<f64>, ErrorValue> {
+    let mut nums = collect_numbers(&args[..1], ctx)?;
+    nums.sort_by(f64::total_cmp);
+    Ok(nums)
+}
+
+/// PERCENTILE.EXC(array, k).
+pub(crate) fn percentile_exc(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 2 {
+        return err(ErrorValue::Value);
+    }
+    sorted_first_argument(args, ctx)
+        .and_then(|nums| percentile_exc_of(&nums, nth_number(args, ctx, 1)?))
+        .into_cell()
+}
+
+/// QUARTILE.EXC(array, quart): quart 1-3, PERCENTILE.EXC at quart/4.
+pub(crate) fn quartile_exc(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 2 {
+        return err(ErrorValue::Value);
+    }
+    sorted_first_argument(args, ctx)
+        .and_then(|nums| {
+            let quart = nth_number(args, ctx, 1)?.trunc();
+            if quart <= 0.0 || quart >= 4.0 {
+                return Err(ErrorValue::Num);
+            }
+            percentile_exc_of(&nums, quart / 4.0)
+        })
+        .into_cell()
+}
+
+/// PERCENTRANK / PERCENTRANK.INC(array, x, [significance]).
+pub(crate) fn percentrank_inc(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    percent_rank(args, ctx, false)
+}
+
+/// PERCENTRANK.EXC(array, x, [significance]).
+pub(crate) fn percentrank_exc(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    percent_rank(args, ctx, true)
+}
+
+/// the rank of x among the values, interpolated between neighbours and
+/// truncated (not rounded) to `significance` digits.
+fn percent_rank(args: &[Expr], ctx: &EvalContext<'_>, exclusive: bool) -> CellValue {
+    if args.len() != 2 && args.len() != 3 {
+        return err(ErrorValue::Value);
+    }
+    (|| {
+        let nums = sorted_first_argument(args, ctx)?;
+        let x = nth_number(args, ctx, 1)?;
+        let digits = match args.get(2) {
+            Some(arg) if !super::omitted(arg) => nth_number(args, ctx, 2)?.trunc(),
+            _ => 3.0,
+        };
+        if digits < 1.0 || nums.is_empty() {
+            return Err(ErrorValue::Num);
+        }
+        let n = nums.len();
+        if x < nums[0] || x > nums[n - 1] {
+            return Err(ErrorValue::NA);
+        }
+        let below = nums.partition_point(|v| *v < x);
+        let position = if nums[below] == x {
+            below as f64
+        } else {
+            let (lo, hi) = (nums[below - 1], nums[below]);
+            (below - 1) as f64 + (x - lo) / (hi - lo)
+        };
+        let rank = if exclusive {
+            (position + 1.0) / (n + 1) as f64
+        } else if n == 1 {
+            1.0
+        } else {
+            position / (n - 1) as f64
+        };
+        let scale = fmath::powi(10.0, digits.min(300.0) as i32);
+        let scaled = rank * scale;
+        // a rank that is a whole number of units must not lose one to rounding
+        let nearest = scaled.round();
+        let units = if (scaled - nearest).abs() <= 1e-9 * nearest.abs().max(1.0) {
+            nearest
+        } else {
+            scaled.floor()
+        };
+        Ok(units / scale)
+    })()
+    .into_cell()
+}
+
+/// VARA(value, ...): the sample variance with text as zero.
+pub(crate) fn vara(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    collect_numbers_anytype(args, ctx)
+        .and_then(|nums| variance_of(&nums, true))
+        .into_cell()
+}
+
+/// VARPA(value, ...): the population variance with text as zero.
+pub(crate) fn varpa(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    collect_numbers_anytype(args, ctx)
+        .and_then(|nums| variance_of(&nums, false))
+        .into_cell()
+}
+
+/// STDEVPA(value, ...): the population standard deviation with text as zero.
+pub(crate) fn stdevpa(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    collect_numbers_anytype(args, ctx)
+        .and_then(|nums| variance_of(&nums, false))
+        .map(f64::sqrt)
+        .into_cell()
+}
+
+/// SKEW.P(number, ...): the population skewness.
+pub(crate) fn skew_p(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    let nums = match collect_numbers_deep(args, ctx) {
+        Ok(nums) => nums,
+        Err(e) => return err(e),
+    };
+    let n = nums.len() as f64;
+    let (mean, variance) = centered(&nums);
+    if nums.len() < 3 || variance <= 0.0 {
+        return err(ErrorValue::Div0);
+    }
+    let sd = (variance * (n - 1.0) / n).sqrt();
+    let total: f64 = nums.iter().map(|x| ((x - mean) / sd).powi(3)).sum();
+    finite(total / n)
+}
+
+/// PROB(x_range, prob_range, lower, [upper]): the probability mass on
+/// `lower..=upper`, or on `lower` alone. the probabilities must sum to one;
+/// excel checks nothing else about them.
+pub(crate) fn prob(args: &[Expr], ctx: &EvalContext<'_>) -> CellValue {
+    if args.len() != 3 && args.len() != 4 {
+        return err(ErrorValue::Value);
+    }
+    (|| {
+        let (xs, ps) = pairs(&args[..2], ctx)?;
+        let lower = nth_number(args, ctx, 2)?;
+        let upper = match args.get(3) {
+            Some(arg) if !super::omitted(arg) => nth_number(args, ctx, 3)?,
+            _ => lower,
+        };
+        if (ps.iter().sum::<f64>() - 1.0).abs() > 1e-10 {
+            return Err(ErrorValue::Num);
+        }
+        Ok(xs
+            .iter()
+            .zip(&ps)
+            .filter(|(x, _)| (lower..=upper).contains(*x))
+            .map(|(_, p)| p)
+            .sum())
+    })()
+    .into_cell()
 }

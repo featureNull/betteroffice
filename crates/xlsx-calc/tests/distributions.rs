@@ -303,6 +303,8 @@ fn t_family() {
     approx_inv("T.INV(0.75,2)", 0.816496580927726);
     approx_inv("T.INV.2T(0.05,60)", 2.0002978220142604);
     approx_inv("TINV(0.05,60)", 2.0002978220142604);
+    // past probability 1 excel answers T.INV(1 - p/2)
+    approx_inv("T.INV.2T(1.5,10)", -0.6998120613124317);
     check(&[
         ("T.DIST(1,0,TRUE)", e(ErrorValue::Num)),
         ("T.DIST.2T(-1,60)", e(ErrorValue::Num)),
@@ -313,7 +315,7 @@ fn t_family() {
         ("T.INV(1,10)", e(ErrorValue::Num)),
         ("T.INV(0.5,0)", e(ErrorValue::Num)),
         ("T.INV.2T(0,60)", e(ErrorValue::Num)),
-        ("T.INV.2T(1.1,60)", e(ErrorValue::Num)),
+        ("T.INV.2T(2,60)", e(ErrorValue::Num)),
         ("TINV(0,60)", e(ErrorValue::Num)),
     ]);
 }
